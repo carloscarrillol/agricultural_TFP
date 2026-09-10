@@ -1,4 +1,4 @@
-## Note: This script only contains the core logic. 
+## Note: This script only contains the core logic and is under building. 
 ## Before running, all datasets stored in external directories must be migrated here.
 ## Once migration is complete, the entire pipeline will be executed using the Git datasets:)
 
