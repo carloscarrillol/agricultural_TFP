@@ -1,5 +1,9 @@
-## This is only code, I have to move on all my data sets stored at other directories,
-## once done, I will run the entire code using git datasets:)
+## Note: This script only contains the core logic. 
+## Before running, all datasets stored in external directories must be migrated here.
+## Once migration is complete, the entire pipeline will be executed using the Git datasets:)
+
+## Best,
+## Carlos
 
 
 library(KFAS)
