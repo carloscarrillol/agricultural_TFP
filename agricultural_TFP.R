@@ -5,7 +5,6 @@
 ## Best,
 ## Carlos
 
-
 library(KFAS)
 library(urca)
 library(dplyr)
@@ -56,7 +55,8 @@ prec_anual <- precip_mens_est %>%
   group_by(CVE_ENT, ENTIDAD, AÑO) %>%
   summarise(PRECIPITACION_ANUAL = sum(PRECIPITACION, na.rm = TRUE), .groups = "drop") %>%
   group_by(CVE_ENT) %>%
-  mutate(anom_z = (PRECIPITACION_ANUAL - mean(PRECIPITACION_ANUAL, na.rm = TRUE)^2)/var(PRECIPITACION_ANUAL)) %>%
+  mutate(anom_z = (PRECIPITACION_ANUAL - mean(PRECIPITACION_ANUAL, na.rm = TRUE)) /
+           sd(PRECIPITACION_ANUAL, na.rm = TRUE)) %>%
   ungroup() %>%
   filter(CVE_ENT != 0)
 
@@ -448,26 +448,9 @@ prod_ag_est %>%
   mutate(participacion = valor_total / sum(valor_total))
 
 
-# =========================================================
-# SEMILLAS: CONVERTIR A PESOS CONSTANTES DE 2015
-# =========================================================
 
 seed_t_nacional <- read_csv("seed_t_nacional.csv")
 
-# =========================================================
-# SEMILLAS EN PESOS CONSTANTES DE 2015
-# =========================================================
-
-
-seed_t_nacional <- read_csv("seed_t_nacional.csv") %>%
-  mutate(
-    Seed_t = Seed_t * tipo_cambio_2015
-  )
-
-
-# =========================================================
-# M EN PESOS DE 2015
-# =========================================================
 
 M_nivel <- datos %>%
   filter(serie == "Intermedios") %>%
@@ -475,43 +458,23 @@ M_nivel <- datos %>%
   rename(M_valor = Valor)
 
 
-# =========================================================
-# UNIR M + SEMILLAS
-# =========================================================
 
 modelo_df_v3 <- modelo_df %>%
   left_join(seed_t_nacional, by = "Año") %>%
   left_join(M_nivel, by = "Año") %>%
   arrange(Año) %>%
   mutate(
-    Seed_t_lag = dplyr::lag(Seed_t),
+    Seed_t_lag    = dplyr::lag(Seed_t),
     M_prime_valor = M_valor + Seed_t_lag
   ) %>%
   filter(!is.na(Seed_t_lag))
 
 modelo_df_v3 <- modelo_df_v3 %>%
   mutate(
-    M_prime = 100 * M_prime_valor / M_prime_valor[Año == 2015],
-    log_Mp = log(M_prime),
-    A_hat_v3 = log_Y -
-      s_K * log_K -
-      s_L * log_L -
-      s_T * log_T -
-      s_M * log_Mp
+    M_prime  = 100 * M_prime_valor / first(M_prime_valor),
+    log_Mp   = log(M_prime),
+    A_hat_v3 = log_Y - s_K*log_K - s_L*log_L - s_T*log_T - s_M*log_Mp
   )
-
-
-# =========================================================
-# VERIFICAR MAGNITUDES
-# =========================================================
-
-summary(modelo_df_v3$M_valor)
-summary(modelo_df_v3$Seed_t_lag)
-
-
-# =========================================================
-# M AMPLIADO
-# =========================================================
 
 
 ggplot() +
@@ -537,58 +500,37 @@ ggplot() +
 
 
 # ============================================================
-# KALMAN: SEPARACIÓN DE A_hat_v3
-# ============================================================
 
 ss_v3 <- SSModel(
-  A_hat_v3 ~
-    SSMtrend(degree = 1, Q = list(matrix(NA))) +
-    SSMarima(
-      ar = c(NA),
-      Q = matrix(NA),
-      stationary = FALSE
-    ),
-  H = matrix(0),
-  data = modelo_df_v3
+  A_hat_v3 ~ SSMtrend(degree = 1, Q = list(matrix(NA))) +
+    SSMarima(ar = c(NA), Q = matrix(NA), stationary = FALSE),
+  H = matrix(1e-4), data = modelo_df_v3
 )
 
 fit_v3 <- fitSSM(
   ss_v3,
-  inits = c(
-    log(var(modelo_df_v3$A_hat_v3, na.rm = TRUE) / 2),
-    log(var(modelo_df_v3$A_hat_v3, na.rm = TRUE) / 2),
-    0
-  ),
+  inits = c(log(var(modelo_df_v3$A_hat_v3, na.rm = TRUE)/2),
+            log(var(modelo_df_v3$A_hat_v3, na.rm = TRUE)/2), 0),
   updatefn = update_fn_Ahat,
   method = "BFGS"
 )
-
 fit_v3$optim.out$convergence
 
-# Suavizado de estados
-kfs_v3 <- KFS(
-  fit_v3$model,
-  smoothing = c("state", "signal")
-)
+kfs_v3 <- KFS(fit_v3$model, smoothing = c("state", "signal"))
 
-# Separación permanente / transitoria
 modelo_df_v3 <- modelo_df_v3 %>%
   mutate(
     mu_hat_v3 = kfs_v3$alphahat[, "level"],
     xi_hat_v3 = kfs_v3$alphahat[, "arima1"]
   )
 
-# Varianzas estimadas
 sigma2_nu_v3  <- exp(fit_v3$optim.out$par[1])
 sigma2_eta_v3 <- exp(fit_v3$optim.out$par[2])
 
-cat(
-  "A_hat_v3 -- sigma2_nu:",
-  sigma2_nu_v3,
-  "| sigma2_eta:",
-  sigma2_eta_v3,
-  "\n"
-)
+cat("Original  (sin Seed) -- sigma2_nu:", sigma2_nu_A, " | sigma2_eta:", sigma2_eta_A, "\n")
+cat("Con Seed (A_hat_v3)  -- sigma2_nu:", sigma2_nu_v3, " | sigma2_eta:", sigma2_eta_v3, "\n")
+
+
 
 ggplot(modelo_df_v3, aes(x = Año)) +
   geom_line(
@@ -611,6 +553,12 @@ ggplot(modelo_df_v3, aes(x = Año)) +
     y = "TFP residual",
     color = ""
   )
+
+
+bp_A_v3 <- breakpoints(A_hat_v3 ~ 1, data = modelo_df_v3)
+break_obs <- breakpoints(bp_A_v3, breaks = 5)$breakpoints
+modelo_df_v3$Año[break_obs]
+
 
 
 
@@ -671,25 +619,18 @@ ggplot() +
     color = ""
   )
 
-break_obs <- breakpoints(bp_A, breaks = 2)$breakpoints
-
-break_obs
-modelo_df_v3$Año[break_obs]
+modelo_df_v3 <- modelo_df_v3 %>% mutate(mu_num = as.numeric(mu_hat_v3))
+bp_mu <- breakpoints(mu_num ~ 1, data = modelo_df_v3)
+summary(bp_mu)
+BIC(bp_mu)
+break_obs_mu <- breakpoints(bp_mu, breaks = 5)$breakpoints
+modelo_df_v3$Año[break_obs_mu]
 
 
 modelo_df_v3 <- modelo_df_v3 %>%
   mutate(
     mu_num = as.numeric(mu_hat_v3)
   )
-bp_mu <- breakpoints(mu_num ~ 1, data = modelo_df_v3)
-
-summary(bp_mu)
-
-BIC(bp_mu)
-
-break_obs_mu <- breakpoints(bp_mu, breaks = 5)$breakpoints
-
-modelo_df_v3$Año[break_obs_mu]
 
 
 ggplot(modelo_df_v3, aes(x = Año, y = mu_num)) +
@@ -764,3 +705,94 @@ ggplot(modelo_df_v3, aes(x = Año)) +
 modelo_df_v3 %>%
   filter(Año %in% c(1994:1998, 2001:2003, 2005:2007, 2008:2010, 2019:2023)) %>%
   select(Año, A_hat_v3, mu_num, xi_num)
+
+
+fechas_quiebre_mu <- modelo_df_v3$Año[break_obs_mu]
+print(fechas_quiebre_mu)   # úsalas para revisar que tengan sentido antes de graficar
+
+## =========================================================
+
+cortes <- c(-Inf, fechas_quiebre_mu, Inf)
+etiquetas <- paste0(head(c(min(modelo_df_v3$Año), fechas_quiebre_mu + 1), -1), "-",
+                    c(fechas_quiebre_mu, max(modelo_df_v3$Año)))
+
+modelo_df_v3 <- modelo_df_v3 %>%
+  mutate(regimen = cut(Año, breaks = cortes, labels = etiquetas, right = TRUE))
+
+tabla_regimenes <- modelo_df_v3 %>%
+  group_by(regimen) %>%
+  summarise(
+    media_mu = mean(mu_num, na.rm = TRUE),
+    sd_mu    = sd(mu_num, na.rm = TRUE),
+    n        = n()
+  )
+print(tabla_regimenes)
+
+## =========================================================
+
+ggplot(modelo_df_v3, aes(x = Año)) +
+  geom_line(aes(y = A_hat_v3, linetype = "TFP residual"), linewidth = 0.8) +
+  geom_line(aes(y = mu_num, linetype = "Componente permanente"), linewidth = 0.8) +
+  geom_vline(xintercept = fechas_quiebre_mu, linetype = "dashed", color = "firebrick") +
+  theme_minimal() +
+  labs(title = "TFP y cambios estructurales (componente permanente)",
+       x = "Año", y = "Componente de TFP", linetype = "")
+
+## =========================================================
+
+modelo_df_v3 <- modelo_df_v3 %>%
+  mutate(xi_num = as.numeric(xi_hat_v3))
+
+xi_ts_v3 <- ts(modelo_df_v3$xi_num, start = min(modelo_df_v3$Año), frequency = 1)
+bp_xi_v3 <- breakpoints(xi_ts_v3 ~ 1)
+fechas_quiebre_xi <- modelo_df_v3$Año[breakpoints(bp_xi_v3, breaks = 5)$breakpoints]
+
+ggplot(modelo_df_v3, aes(x = Año)) +
+  geom_line(aes(y = A_hat_v3, color = "TFP residual"), linewidth = 0.8) +
+  geom_line(aes(y = mu_num, color = "Permanente"), linewidth = 0.8) +
+  geom_line(aes(y = xi_num, color = "Transitorio"), linewidth = 0.8, linetype = "dashed") +
+  geom_vline(xintercept = fechas_quiebre_xi, linetype = "dotted", color = "steelblue") +
+  theme_minimal() +
+  labs(title = "TFP con Seed: componentes permanente y transitorio, quiebres del transitorio",
+       x = "Año", y = "Componente", color = "")
+
+## =========================================================
+
+cat("Quiebres A_hat_v3 completo:", modelo_df_v3$Año[break_obs], "\n")
+cat("Quiebres mu (permanente):  ", fechas_quiebre_mu, "\n")
+cat("Quiebres xi (transitorio): ", fechas_quiebre_xi, "\n")
+
+
+modelo_df_v3 %>%
+  filter(Año %in% c(1994:1998, 2001:2003, 2005:2007, 2008:2010, 2019:2023)) %>%
+  select(Año, A_hat_v3, mu_num, xi_num)
+
+
+break_obs    <- breakpoints(bp_A_v3, breaks = 4)$breakpoints
+break_obs_mu <- breakpoints(bp_mu,   breaks = 4)$breakpoints
+break_obs_xi <- breakpoints(bp_xi_v3, breaks = 4)$breakpoints
+
+cat("A_hat_v3:  ", modelo_df_v3$Año[break_obs],    "\n")
+cat("mu:        ", modelo_df_v3$Año[break_obs_mu], "\n")
+cat("xi:        ", modelo_df_v3$Año[break_obs_xi], "\n")
+
+cat("sigma2_nu_v3: ", sigma2_nu_v3, "\n")
+cat("sigma2_eta_v3:", sigma2_eta_v3, "\n")
+
+
+## =========================================================
+## Chow test requiere el punto como índice de observación, no año --
+## conviértelo primero
+punto_chow <- function(año) which(modelo_df_v3$Año == año)
+
+## 1992 -- Ley Agraria / reforma Art. 27 (si tu ventana de datos la cubre)
+if (1992 %in% modelo_df_v3$Año) {
+  sctest(mu_num ~ 1, data = modelo_df_v3, type = "Chow", point = punto_chow(1992))
+}
+
+## 1994 -- inicio TLCAN
+sctest(mu_num ~ 1, data = modelo_df_v3, type = "Chow", point = punto_chow(1994))
+
+## 2008 -- desgravación total TLCAN (maíz/frijol sin cuota)
+sctest(mu_num ~ 1, data = modelo_df_v3, type = "Chow", point = punto_chow(2008))
+
