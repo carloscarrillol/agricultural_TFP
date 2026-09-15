@@ -56,8 +56,7 @@ prec_anual <- precip_mens_est %>%
   group_by(CVE_ENT, ENTIDAD, AÑO) %>%
   summarise(PRECIPITACION_ANUAL = sum(PRECIPITACION, na.rm = TRUE), .groups = "drop") %>%
   group_by(CVE_ENT) %>%
-  mutate(anom_z = (PRECIPITACION_ANUAL - mean(PRECIPITACION_ANUAL, na.rm = TRUE)) /
-           sd(PRECIPITACION_ANUAL, na.rm = TRUE)) %>%
+  mutate(anom_z = (PRECIPITACION_ANUAL - mean(PRECIPITACION_ANUAL, na.rm = TRUE)^2)/var(PRECIPITACION_ANUAL)) %>%
   ungroup() %>%
   filter(CVE_ENT != 0)
 
@@ -298,7 +297,7 @@ s_M <- 0.30
 
 modelo_df <- modelo_df %>%
   mutate(
-    A_hat   = log_Y - s_K * log_K - s_L * log_L - s_T * log_T - s_M*M,
+    A_hat   = log_Y - s_K * log_K - s_L * log_L - s_T * log_T - s_M*log_M,
     d_A_hat = d_log_Y - s_K * d_log_K - s_L * d_log_L - s_T * d_log_T - s_M*d_log_M
   )
 
@@ -449,4 +448,319 @@ prod_ag_est %>%
   mutate(participacion = valor_total / sum(valor_total))
 
 
+# =========================================================
+# SEMILLAS: CONVERTIR A PESOS CONSTANTES DE 2015
+# =========================================================
 
+seed_t_nacional <- read_csv("seed_t_nacional.csv")
+
+# =========================================================
+# SEMILLAS EN PESOS CONSTANTES DE 2015
+# =========================================================
+
+
+seed_t_nacional <- read_csv("seed_t_nacional.csv") %>%
+  mutate(
+    Seed_t = Seed_t * tipo_cambio_2015
+  )
+
+
+# =========================================================
+# M EN PESOS DE 2015
+# =========================================================
+
+M_nivel <- datos %>%
+  filter(serie == "Intermedios") %>%
+  select(Año, Valor) %>%
+  rename(M_valor = Valor)
+
+
+# =========================================================
+# UNIR M + SEMILLAS
+# =========================================================
+
+modelo_df_v3 <- modelo_df %>%
+  left_join(seed_t_nacional, by = "Año") %>%
+  left_join(M_nivel, by = "Año") %>%
+  arrange(Año) %>%
+  mutate(
+    Seed_t_lag = dplyr::lag(Seed_t),
+    M_prime_valor = M_valor + Seed_t_lag
+  ) %>%
+  filter(!is.na(Seed_t_lag))
+
+modelo_df_v3 <- modelo_df_v3 %>%
+  mutate(
+    M_prime = 100 * M_prime_valor / M_prime_valor[Año == 2015],
+    log_Mp = log(M_prime),
+    A_hat_v3 = log_Y -
+      s_K * log_K -
+      s_L * log_L -
+      s_T * log_T -
+      s_M * log_Mp
+  )
+
+
+# =========================================================
+# VERIFICAR MAGNITUDES
+# =========================================================
+
+summary(modelo_df_v3$M_valor)
+summary(modelo_df_v3$Seed_t_lag)
+
+
+# =========================================================
+# M AMPLIADO
+# =========================================================
+
+
+ggplot() +
+  geom_line(
+    data = modelo_df,
+    aes(x = Año, y = A_hat, color = "A_hat original"),
+    linewidth = 0.8
+  ) +
+  geom_line(
+    data = modelo_df_v3,
+    aes(x = Año, y = A_hat_v3, color = "A_hat_v3 con Seed"),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "TFP: especificación original vs. con Seed",
+    x = "Año",
+    y = "A_hat",
+    color = ""
+  )
+
+
+
+# ============================================================
+# KALMAN: SEPARACIÓN DE A_hat_v3
+# ============================================================
+
+ss_v3 <- SSModel(
+  A_hat_v3 ~
+    SSMtrend(degree = 1, Q = list(matrix(NA))) +
+    SSMarima(
+      ar = c(NA),
+      Q = matrix(NA),
+      stationary = FALSE
+    ),
+  H = matrix(0),
+  data = modelo_df_v3
+)
+
+fit_v3 <- fitSSM(
+  ss_v3,
+  inits = c(
+    log(var(modelo_df_v3$A_hat_v3, na.rm = TRUE) / 2),
+    log(var(modelo_df_v3$A_hat_v3, na.rm = TRUE) / 2),
+    0
+  ),
+  updatefn = update_fn_Ahat,
+  method = "BFGS"
+)
+
+fit_v3$optim.out$convergence
+
+# Suavizado de estados
+kfs_v3 <- KFS(
+  fit_v3$model,
+  smoothing = c("state", "signal")
+)
+
+# Separación permanente / transitoria
+modelo_df_v3 <- modelo_df_v3 %>%
+  mutate(
+    mu_hat_v3 = kfs_v3$alphahat[, "level"],
+    xi_hat_v3 = kfs_v3$alphahat[, "arima1"]
+  )
+
+# Varianzas estimadas
+sigma2_nu_v3  <- exp(fit_v3$optim.out$par[1])
+sigma2_eta_v3 <- exp(fit_v3$optim.out$par[2])
+
+cat(
+  "A_hat_v3 -- sigma2_nu:",
+  sigma2_nu_v3,
+  "| sigma2_eta:",
+  sigma2_eta_v3,
+  "\n"
+)
+
+ggplot(modelo_df_v3, aes(x = Año)) +
+  geom_line(
+    aes(y = A_hat_v3, color = "A_hat_v3"),
+    linewidth = 0.8
+  ) +
+  geom_line(
+    aes(y = mu_hat_v3, color = "Componente permanente"),
+    linewidth = 0.8
+  ) +
+  geom_line(
+    aes(y = xi_hat_v3, color = "Componente transitorio"),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Separación Kalman de TFP con semillas",
+    x = "Año",
+    y = "TFP residual",
+    color = ""
+  )
+
+
+
+ggplot() +
+  # Eventos
+  geom_rect(
+    aes(xmin = 1991.5, xmax = 1992.5, ymin = -Inf, ymax = Inf),
+    fill = "grey70", alpha = 0.4
+  ) +
+  geom_rect(
+    aes(xmin = 1993.5, xmax = 1994.5, ymin = -Inf, ymax = Inf),
+    fill = "grey70", alpha = 0.4
+  ) +
+  geom_rect(
+    aes(xmin = 2007.5, xmax = 2009.5, ymin = -Inf, ymax = Inf),
+    fill = "grey70", alpha = 0.4
+  ) +
+  geom_rect(
+    aes(xmin = 2019.5, xmax = 2020.5, ymin = -Inf, ymax = Inf),
+    fill = "grey70", alpha = 0.4
+  ) +
+  
+  # Permanente original
+  geom_line(
+    data = modelo_df,
+    aes(x = Año, y = mu_hat_A, color = "Permanente original"),
+    linewidth = 0.8
+  ) +
+  
+  # Transitorio original
+  geom_line(
+    data = modelo_df,
+    aes(x = Año, y = xi_hat_A, color = "Transitorio original"),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  
+  # Permanente + Seed
+  geom_line(
+    data = modelo_df_v3,
+    aes(x = Año, y = mu_hat_v3, color = "Permanente + Seed"),
+    linewidth = 0.8
+  ) +
+  
+  # Transitorio + Seed
+  geom_line(
+    data = modelo_df_v3,
+    aes(x = Año, y = xi_hat_v3, color = "Transitorio + Seed"),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "Descomposición Kalman de la TFP",
+    x = "Año",
+    y = "Componente de TFP",
+    color = ""
+  )
+
+break_obs <- breakpoints(bp_A, breaks = 2)$breakpoints
+
+break_obs
+modelo_df_v3$Año[break_obs]
+
+
+modelo_df_v3 <- modelo_df_v3 %>%
+  mutate(
+    mu_num = as.numeric(mu_hat_v3)
+  )
+bp_mu <- breakpoints(mu_num ~ 1, data = modelo_df_v3)
+
+summary(bp_mu)
+
+BIC(bp_mu)
+
+break_obs_mu <- breakpoints(bp_mu, breaks = 5)$breakpoints
+
+modelo_df_v3$Año[break_obs_mu]
+
+
+ggplot(modelo_df_v3, aes(x = Año, y = mu_num)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(
+    xintercept = c(1997, 2002, 2006, 2011, 2016),
+    linetype = "dashed"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Cambios estructurales en el componente permanente de la TFP",
+    x = "Año",
+    y = "Componente permanente"
+  )
+
+modelo_df_v3 %>%
+  mutate(
+    regimen = case_when(
+      Año <= 1997 ~ "1980-1997",
+      Año <= 2002 ~ "1998-2002",
+      Año <= 2006 ~ "2003-2006",
+      Año <= 2011 ~ "2007-2011",
+      Año <= 2016 ~ "2012-2016",
+      TRUE ~ "2017-2023"
+    )
+  ) %>%
+  group_by(regimen) %>%
+  summarise(
+    media_mu = mean(mu_num, na.rm = TRUE),
+    sd_mu = sd(mu_num, na.rm = TRUE),
+    n = n()
+  )
+
+ggplot(modelo_df_v3, aes(x = Año)) +
+  geom_line(aes(y = A_hat_v3, linetype = "TFP residual"), linewidth = 0.8) +
+  geom_line(aes(y = mu_num, linetype = "Componente permanente"), linewidth = 0.8) +
+  geom_vline(
+    xintercept = c(1996, 1997, 2002, 2006, 2011, 2016, 2020),
+    linetype = "dashed"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "TFP y cambios estructurales",
+    x = "Año",
+    y = "Componente de TFP",
+    linetype = ""
+  )
+
+
+modelo_df_v3 <- modelo_df_v3 %>%
+  mutate(
+    mu_num = as.numeric(mu_hat_v3),
+    xi_num = as.numeric(xi_hat_v3)
+  )
+
+ggplot(modelo_df_v3, aes(x = Año)) +
+  geom_line(aes(y = A_hat_v3, color = "TFP residual"), linewidth = 0.8) +
+  geom_line(aes(y = mu_num, color = "Permanente"), linewidth = 0.8) +
+  geom_line(aes(y = xi_num, color = "Transitorio"), linewidth = 0.8, linetype = "dashed") +
+  geom_vline(
+    xintercept = c(1996, 1997, 2002, 2006, 2011, 2016, 2020),
+    linetype = "dashed"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "TFP: componentes permanente y transitorio",
+    x = "Año",
+    y = "Componente",
+    color = ""
+  )
+
+modelo_df_v3 %>%
+  filter(Año %in% c(1994:1998, 2001:2003, 2005:2007, 2008:2010, 2019:2023)) %>%
+  select(Año, A_hat_v3, mu_num, xi_num)
